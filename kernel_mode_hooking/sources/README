@@ -1,0 +1,13 @@
+To test it just do:
+
+$ cd hook_setuid
+$ ./configure.sh
+$ make
+$ sudo insmod hook_setuid.ko
+$ gcc get_root.c -o get_root
+$ ./get_root
+
+
+After you finish do:
+
+$ sudo rmmod hook_setuid
